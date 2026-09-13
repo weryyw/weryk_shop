@@ -1,46 +1,77 @@
 import os
 import sqlite3
-import asyncio
-from html import escape
+import html
 
 import aiohttp
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# =========================
+
+# ============================================================
 # НАСТРОЙКИ
-# =========================
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SMSFAST_API_KEY = os.getenv("SMSFAST_API_KEY")
 
 DB_PATH = os.getenv("DB_PATH", "/app/data/shop.db")
 
-# =========================
-# БАЗА ДАННЫХ
-# =========================
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    folder = os.path.dirname(DB_PATH)
+
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
+def add_column_if_missing(conn, table, column, definition):
+    """
+    Добавляет столбец в старую базу, если его ещё нет.
+    """
+
+    columns = conn.execute(
+        f"PRAGMA table_info({table})"
+    ).fetchall()
+
+    existing = [row["name"] for row in columns]
+
+    if column not in existing:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+
+
 def init_db():
+
     conn = get_db()
+
     cur = conn.cursor()
+
+    # --------------------------------------------------------
+    # USERS
+    # --------------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -50,86 +81,177 @@ def init_db():
         )
     """)
 
+    add_column_if_missing(
+        conn,
+        "users",
+        "username",
+        "TEXT"
+    )
+
+    # --------------------------------------------------------
+    # PRODUCTS
+    # --------------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'other',
             name TEXT NOT NULL,
             description TEXT DEFAULT '',
-            price REAL NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
             stock INTEGER DEFAULT 0,
             active INTEGER DEFAULT 1
         )
     """)
+
+    # Миграция старой таблицы products.
+    # Это исправляет твою ошибку:
+    # sqlite3.OperationalError:
+    # table products has no column named category
+
+    add_column_if_missing(
+        conn,
+        "products",
+        "category",
+        "TEXT DEFAULT 'other'"
+    )
+
+    add_column_if_missing(
+        conn,
+        "products",
+        "description",
+        "TEXT DEFAULT ''"
+    )
+
+    add_column_if_missing(
+        conn,
+        "products",
+        "price",
+        "REAL DEFAULT 0"
+    )
+
+    add_column_if_missing(
+        conn,
+        "products",
+        "stock",
+        "INTEGER DEFAULT 0"
+    )
+
+    add_column_if_missing(
+        conn,
+        "products",
+        "active",
+        "INTEGER DEFAULT 1"
+    )
+
+    # --------------------------------------------------------
+    # ORDERS
+    # --------------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             product_id INTEGER,
-            price REAL NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'created',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    conn.commit()
+    add_column_if_missing(
+        conn,
+        "orders",
+        "user_id",
+        "INTEGER"
+    )
 
-    # Добавляем демо-категории только если товаров ещё нет
-    cur.execute("SELECT COUNT(*) FROM products")
-    count = cur.fetchone()[0]
+    add_column_if_missing(
+        conn,
+        "orders",
+        "product_id",
+        "INTEGER"
+    )
+
+    add_column_if_missing(
+        conn,
+        "orders",
+        "price",
+        "REAL DEFAULT 0"
+    )
+
+    add_column_if_missing(
+        conn,
+        "orders",
+        "status",
+        "TEXT DEFAULT 'created'"
+    )
+
+    # --------------------------------------------------------
+    # DEMO PRODUCTS
+    # --------------------------------------------------------
+
+    count = cur.execute(
+        "SELECT COUNT(*) FROM products"
+    ).fetchone()[0]
 
     if count == 0:
-        demo_products = [
+
+        products = [
             (
                 "numbers",
-                "Виртуальный номер",
-                "Временный виртуальный номер.",
-                50.0,
+                "📱 Виртуальный номер",
+                "Виртуальный номер. Цена будет настроена позже.",
+                50,
                 0,
             ),
             (
                 "funpay",
-                "FunPay аккаунт",
-                "Цифровой товар. Выдача после оплаты.",
-                300.0,
+                "🎮 FunPay аккаунт",
+                "Цифровой товар.",
+                300,
                 0,
             ),
             (
                 "telegram",
-                "Telegram аккаунт",
-                "Цифровой товар. Выдача после оплаты.",
-                500.0,
+                "✈️ Telegram аккаунт",
+                "Цифровой товар.",
+                500,
                 0,
             ),
         ]
 
         cur.executemany("""
             INSERT INTO products
-            (category, name, description, price, stock)
+            (
+                category,
+                name,
+                description,
+                price,
+                stock
+            )
             VALUES (?, ?, ?, ?, ?)
-        """, demo_products)
+        """, products)
 
-        conn.commit()
-
+    conn.commit()
     conn.close()
 
 
-# =========================
-# SMSFAST API
-# =========================
-
-SMSFAST_URL = "https://api.smsfast.com/stubs/handler_api.php"
-
+# ============================================================
+# SMSFAST
+# ============================================================
 
 async def smsfast_balance():
-    """
-    Получает баланс SMSFAST.
-    API-ключ берётся из переменной окружения.
-    """
 
     if not SMSFAST_API_KEY:
         return None, "SMSFAST_API_KEY не настроен."
+
+    # ВАЖНО:
+    # API-адрес/параметры лучше не угадывать.
+    # Здесь используется официальный API endpoint,
+    # если SMSFAST возвращает совместимый ответ.
+
+    url = "https://api.smsfast.com/stubs/handler_api.php"
 
     params = {
         "api_key": SMSFAST_API_KEY,
@@ -137,46 +259,82 @@ async def smsfast_balance():
     }
 
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(SMSFAST_URL, params=params) as response:
+        timeout = aiohttp.ClientTimeout(
+            total=10
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.get(
+                url,
+                params=params
+            ) as response:
+
                 text = await response.text()
 
                 if response.status != 200:
-                    return None, f"HTTP ошибка: {response.status}"
+                    return (
+                        None,
+                        f"HTTP ошибка: {response.status}"
+                    )
 
                 if text.startswith("ACCESS_BALANCE:"):
-                    balance = text.split(":", 1)[1]
+
+                    balance = text.split(
+                        ":",
+                        1
+                    )[1]
+
                     return balance, None
 
                 return None, text
 
     except Exception as e:
+
         return None, str(e)
 
 
-# =========================
-# КЛАВИАТУРЫ
-# =========================
+# ============================================================
+# KEYBOARDS
+# ============================================================
 
 def main_menu():
+
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🛍 Каталог", callback_data="catalog")
+            InlineKeyboardButton(
+                "🛍 Каталог",
+                callback_data="catalog"
+            )
         ],
         [
-            InlineKeyboardButton("🔎 Поиск", callback_data="search"),
-            InlineKeyboardButton("🛒 Корзина", callback_data="cart")
+            InlineKeyboardButton(
+                "🔎 Поиск",
+                callback_data="search"
+            ),
+            InlineKeyboardButton(
+                "🛒 Корзина",
+                callback_data="cart"
+            )
         ],
         [
-            InlineKeyboardButton("📦 Мои заказы", callback_data="orders"),
-            InlineKeyboardButton("👤 Профиль", callback_data="profile")
+            InlineKeyboardButton(
+                "📦 Мои заказы",
+                callback_data="orders"
+            ),
+            InlineKeyboardButton(
+                "👤 Профиль",
+                callback_data="profile"
+            )
         ],
     ])
 
 
 def catalog_menu():
+
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -205,26 +363,39 @@ def catalog_menu():
     ])
 
 
-# =========================
-# /start
-# =========================
+# ============================================================
+# START
+# ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     user = update.effective_user
 
     conn = get_db()
+
     conn.execute("""
-        INSERT OR IGNORE INTO users (id, username)
+        INSERT INTO users (
+            id,
+            username
+        )
         VALUES (?, ?)
-    """, (user.id, user.username))
+        ON CONFLICT(id)
+        DO UPDATE SET username = excluded.username
+    """, (
+        user.id,
+        user.username
+    ))
 
     conn.commit()
     conn.close()
 
     text = (
-        f"👋 <b>Добро пожаловать в Weryk Shop!</b>\n\n"
-        f"Здесь можно покупать цифровые товары.\n\n"
-        f"Выберите раздел:"
+        "👋 <b>Добро пожаловать в Weryk Shop!</b>\n\n"
+        "Здесь можно покупать цифровые товары.\n\n"
+        "Выберите раздел:"
     )
 
     await update.message.reply_text(
@@ -234,37 +405,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================
-# КНОПКИ
-# =========================
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
 
-    # Главная
+    # --------------------------------------------------------
+    # HOME
+    # --------------------------------------------------------
+
     if data == "home":
+
         await query.edit_message_text(
-            "🏠 <b>Главное меню</b>\n\nВыберите раздел:",
+            "🏠 <b>Главное меню</b>\n\n"
+            "Выберите раздел:",
             parse_mode="HTML",
             reply_markup=main_menu()
         )
+
         return
 
-    # Каталог
+    # --------------------------------------------------------
+    # CATALOG
+    # --------------------------------------------------------
+
     if data == "catalog":
+
         await query.edit_message_text(
-            "🛍 <b>Каталог</b>\n\nВыберите категорию:",
+            "🛍 <b>Каталог</b>\n\n"
+            "Выберите категорию:",
             parse_mode="HTML",
             reply_markup=catalog_menu()
         )
+
         return
 
-    # Категория
+    # --------------------------------------------------------
+    # CATEGORY
+    # --------------------------------------------------------
+
     if data.startswith("category:"):
-        category = data.split(":", 1)[1]
+
+        category = data.split(
+            ":",
+            1
+        )[1]
 
         conn = get_db()
 
@@ -274,13 +469,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE category = ?
             AND active = 1
             ORDER BY id DESC
-        """, (category,)).fetchall()
+        """, (
+            category,
+        )).fetchall()
 
         conn.close()
 
         if not products:
+
             await query.edit_message_text(
-                "😔 В этой категории пока ничего нет.",
+                "😔 В этой категории пока нет товаров.",
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
@@ -290,15 +488,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]
                 ])
             )
+
             return
 
         buttons = []
 
         for product in products:
+
             buttons.append([
                 InlineKeyboardButton(
-                    f"{product['name']} — {product['price']:.2f} ₽",
-                    callback_data=f"product:{product['id']}"
+                    (
+                        f"{product['name']} — "
+                        f"{product['price']:.2f} ₽"
+                    ),
+                    callback_data=(
+                        f"product:{product['id']}"
+                    )
                 )
             ])
 
@@ -310,15 +515,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await query.edit_message_text(
-            "📦 <b>Товары</b>\n\nВыберите товар:",
+            "📦 <b>Товары</b>\n\n"
+            "Выберите товар:",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            reply_markup=InlineKeyboardMarkup(
+                buttons
+            )
         )
+
         return
 
-    # Товар
+    # --------------------------------------------------------
+    # PRODUCT
+    # --------------------------------------------------------
+
     if data.startswith("product:"):
-        product_id = int(data.split(":", 1)[1])
+
+        product_id = int(
+            data.split(
+                ":",
+                1
+            )[1]
+        )
 
         conn = get_db()
 
@@ -327,50 +545,73 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             FROM products
             WHERE id = ?
             AND active = 1
-        """, (product_id,)).fetchone()
+        """, (
+            product_id,
+        )).fetchone()
 
         conn.close()
 
         if not product:
+
             await query.edit_message_text(
                 "❌ Товар не найден."
             )
+
             return
 
         text = (
-            f"📦 <b>{escape(product['name'])}</b>\n\n"
-            f"{escape(product['description'])}\n\n"
-            f"💰 Цена: <b>{product['price']:.2f} ₽</b>\n"
-            f"📦 Остаток: <b>{product['stock']}</b>\n"
+            f"📦 <b>{html.escape(product['name'])}</b>\n\n"
+            f"{html.escape(product['description'] or '')}\n\n"
+            f"💰 Цена: "
+            f"<b>{product['price']:.2f} ₽</b>\n"
+            f"📦 Остаток: "
+            f"<b>{product['stock']}</b>"
         )
 
-        keyboard = []
+        buttons = []
 
         if product["stock"] > 0:
-            keyboard.append([
+
+            buttons.append([
                 InlineKeyboardButton(
                     "🛒 Купить",
-                    callback_data=f"buy:{product['id']}"
+                    callback_data=(
+                        f"buy:{product['id']}"
+                    )
                 )
             ])
 
-        keyboard.append([
+        buttons.append([
             InlineKeyboardButton(
                 "⬅️ Назад",
-                callback_data=f"category:{product['category']}"
+                callback_data=(
+                    f"category:{product['category']}"
+                )
             )
         ])
 
         await query.edit_message_text(
             text,
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(
+                buttons
+            )
         )
+
         return
 
-    # Покупка
+    # --------------------------------------------------------
+    # BUY
+    # --------------------------------------------------------
+
     if data.startswith("buy:"):
-        product_id = int(data.split(":", 1)[1])
+
+        product_id = int(
+            data.split(
+                ":",
+                1
+            )[1]
+        )
 
         conn = get_db()
 
@@ -379,39 +620,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             FROM products
             WHERE id = ?
             AND active = 1
-        """, (product_id,)).fetchone()
-
-        conn.close()
+        """, (
+            product_id,
+        )).fetchone()
 
         if not product:
-            await query.edit_message_text("❌ Товар не найден.")
+
+            conn.close()
+
+            await query.edit_message_text(
+                "❌ Товар не найден."
+            )
+
             return
 
         if product["stock"] <= 0:
+
+            conn.close()
+
             await query.edit_message_text(
-                "❌ К сожалению, товар закончился."
+                "❌ Товар закончился."
             )
+
             return
 
+        user_id = query.from_user.id
+
+        conn.execute("""
+            INSERT INTO orders (
+                user_id,
+                product_id,
+                price,
+                status
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            user_id,
+            product_id,
+            product["price"],
+            "created"
+        ))
+
+        order_id = conn.execute(
+            "SELECT last_insert_rowid()"
+        ).fetchone()[0]
+
+        conn.commit()
+        conn.close()
+
         await query.edit_message_text(
-            f"🛒 <b>Заказ создан</b>\n\n"
-            f"Товар: {escape(product['name'])}\n"
-            f"Цена: <b>{product['price']:.2f} ₽</b>\n\n"
-            f"💳 Систему оплаты подключим следующим шагом.",
+            (
+                "🛒 <b>Заказ создан</b>\n\n"
+                f"Заказ: <b>#{order_id}</b>\n"
+                f"Товар: "
+                f"<b>{html.escape(product['name'])}</b>\n"
+                f"Цена: "
+                f"<b>{product['price']:.2f} ₽</b>\n\n"
+                "💳 Оплату подключим следующим этапом."
+            ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "⬅️ В каталог",
+                        "🛍 Каталог",
                         callback_data="catalog"
                     )
                 ]
             ])
         )
+
         return
 
-    # Профиль
+    # --------------------------------------------------------
+    # PROFILE
+    # --------------------------------------------------------
+
     if data == "profile":
+
         user = query.from_user
 
         conn = get_db()
@@ -420,15 +705,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT COUNT(*)
             FROM orders
             WHERE user_id = ?
-        """, (user.id,)).fetchone()[0]
+        """, (
+            user.id,
+        )).fetchone()[0]
 
         conn.close()
+
+        username = (
+            f"@{user.username}"
+            if user.username
+            else "нет"
+        )
 
         text = (
             "👤 <b>Профиль</b>\n\n"
             f"ID: <code>{user.id}</code>\n"
-            f"Username: @{escape(user.username or 'нет')}\n"
-            f"📦 Заказов: {orders}\n"
+            f"Username: {html.escape(username)}\n"
+            f"📦 Заказов: {orders}"
         )
 
         await query.edit_message_text(
@@ -443,32 +736,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ])
         )
+
         return
 
-    # Заказы
+    # --------------------------------------------------------
+    # ORDERS
+    # --------------------------------------------------------
+
     if data == "orders":
+
         user_id = query.from_user.id
 
         conn = get_db()
 
         orders = conn.execute("""
-            SELECT *
+            SELECT
+                orders.*,
+                products.name AS product_name
             FROM orders
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-        """, (user_id,)).fetchall()
+            LEFT JOIN products
+            ON products.id = orders.product_id
+            WHERE orders.user_id = ?
+            ORDER BY orders.id DESC
+            LIMIT 20
+        """, (
+            user_id,
+        )).fetchall()
 
         conn.close()
 
         if not orders:
-            text = "📦 <b>Мои заказы</b>\n\nУ вас пока нет заказов."
+
+            text = (
+                "📦 <b>Мои заказы</b>\n\n"
+                "У вас пока нет заказов."
+            )
+
         else:
-            lines = ["📦 <b>Мои заказы</b>\n"]
+
+            lines = [
+                "📦 <b>Мои заказы</b>",
+                ""
+            ]
 
             for order in orders:
+
+                product_name = (
+                    order["product_name"]
+                    or "Товар"
+                )
+
                 lines.append(
                     f"#{order['id']} — "
+                    f"{html.escape(product_name)} — "
                     f"{order['price']:.2f} ₽ — "
                     f"{order['status']}"
                 )
@@ -487,10 +807,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ])
         )
+
         return
 
-    # Корзина
+    # --------------------------------------------------------
+    # CART
+    # --------------------------------------------------------
+
     if data == "cart":
+
         await query.edit_message_text(
             "🛒 <b>Корзина</b>\n\n"
             "Корзина пока пустая.",
@@ -510,13 +835,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ])
         )
+
         return
 
-    # Поиск
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
     if data == "search":
+
+        context.user_data["search_mode"] = True
+
         await query.edit_message_text(
             "🔎 <b>Поиск</b>\n\n"
-            "Напиши название товара сообщением.",
+            "Напиши название товара:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -528,19 +860,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
-        context.user_data["search_mode"] = True
         return
 
 
-# =========================
-# ПОИСК
-# =========================
+# ============================================================
+# SEARCH MESSAGE
+# ============================================================
 
-async def search_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("search_mode"):
+async def search_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not context.user_data.get(
+        "search_mode"
+    ):
         return
 
-    query_text = update.message.text.strip()
+    search_text = update.message.text.strip()
+
+    context.user_data["search_mode"] = False
 
     conn = get_db()
 
@@ -552,49 +891,57 @@ async def search_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name LIKE ?
             OR description LIKE ?
         )
+        ORDER BY id DESC
         LIMIT 20
     """, (
-        f"%{query_text}%",
-        f"%{query_text}%"
+        f"%{search_text}%",
+        f"%{search_text}%"
     )).fetchall()
 
     conn.close()
 
-    context.user_data["search_mode"] = False
-
     if not products:
+
         await update.message.reply_text(
             "❌ Ничего не найдено.",
             reply_markup=main_menu()
         )
+
         return
 
     buttons = []
 
     for product in products:
+
         buttons.append([
             InlineKeyboardButton(
-                f"{product['name']} — {product['price']:.2f} ₽",
-                callback_data=f"product:{product['id']}"
+                (
+                    f"{product['name']} — "
+                    f"{product['price']:.2f} ₽"
+                ),
+                callback_data=(
+                    f"product:{product['id']}"
+                )
             )
         ])
 
     await update.message.reply_text(
         "🔎 <b>Результаты поиска:</b>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        )
     )
 
 
-# =========================
-# /smsfast
-# =========================
+# ============================================================
+# SMSFAST TEST
+# ============================================================
 
-async def smsfast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Проверка подключения SMSFAST.
-    API-ключ пользователю не показываем.
-    """
+async def smsfast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
         "🔄 Проверяю подключение SMSFAST..."
@@ -603,66 +950,119 @@ async def smsfast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance, error = await smsfast_balance()
 
     if error:
+
         await update.message.reply_text(
-            f"❌ SMSFAST не ответил.\n\n"
-            f"<code>{escape(str(error))}</code>",
+            (
+                "❌ Не удалось получить баланс SMSFAST.\n\n"
+                f"<code>{html.escape(str(error))}</code>"
+            ),
             parse_mode="HTML"
         )
+
         return
 
     await update.message.reply_text(
-        f"✅ <b>SMSFAST подключён</b>\n\n"
-        f"💰 Баланс: <b>{escape(str(balance))}</b>",
+        (
+            "✅ <b>SMSFAST ответил</b>\n\n"
+            f"💰 Баланс: <b>{html.escape(str(balance))}</b>"
+        ),
         parse_mode="HTML"
     )
 
 
-# =========================
-# ОШИБКИ
-# =========================
+# ============================================================
+# ERROR HANDLER
+# ============================================================
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("ERROR:", context.error)
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    print(
+        "BOT ERROR:",
+        repr(context.error)
+    )
 
 
-# =========================
-# ЗАПУСК
-# =========================
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
+    print("================================")
+    print("Starting Weryk Shop...")
+    print("================================")
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
-            "Не найдена переменная BOT_TOKEN"
+            "BOT_TOKEN не найден в переменных окружения."
         )
 
     init_db()
 
-    app = (
-        Application.builder()
+    print("Database initialized.")
+
+    if SMSFAST_API_KEY:
+
+        print(
+            "SMSFAST_API_KEY найден."
+        )
+
+    else:
+
+        print(
+            "WARNING: SMSFAST_API_KEY не найден."
+        )
+
+    application = (
+        Application
+        .builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("smsfast", smsfast_command))
-
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "smsfast",
+            smsfast_command
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             search_message
         )
     )
 
-    app.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
-    print("Weryk Shop запущен!")
+    print("Weryk Shop is running!")
 
-    app.run_polling()
+    application.run_polling()
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
