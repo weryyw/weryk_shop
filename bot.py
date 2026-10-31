@@ -13,15 +13,19 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # ============================================================
 # ЗАМЕНИ слово "тарелка" на настоящий токен от @BotFather.
-TOKEN = "9138228373:AAF_DUbsqHcHViLq0J-1JD8nhr7uydxdcC4"
+TOKEN = os.getenv("9138228373:AAF_DUbsqHcHViLq0J-1JD8nhr7uydxdcC4", "").strip()
 
-# ЗАМЕНИ 123456789 на свой числовой Telegram ID.
-ADMIN_ID = 5203432796
+# Числовой Telegram ID администратора задаётся в переменных окружения Bothost.
+try:
+    ADMIN_ID = int(os.getenv("5203432796", "0"))
+except ValueError:
+    ADMIN_ID = 0
 
 # База данных хранится в папке data.
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "grace_store.db"
+PHOTO_DIR = Path("photos")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -92,7 +96,7 @@ def init_db():
         db.commit()
 
 def is_admin(user_id):
-    return ADMIN_ID != 123456789 and user_id == ADMIN_ID
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
 
 def money(amount):
     return f"{amount:,}".replace(",", " ") + " ₽"
@@ -103,7 +107,8 @@ def main_menu():
         [InlineKeyboardButton("🛒 Корзина", callback_data="cart")],
         [InlineKeyboardButton("📦 Мои заказы", callback_data="orders")],
         [InlineKeyboardButton("🎫 Техническая поддержка", callback_data="support")],
-        [InlineKeyboardButton("👤 Профиль", callback_data="profile")]
+        [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton("⭐ Отзывы", url="https://t.me/fjgrtgkk3krkger5hjgsjrtl5gl")]
     ])
 
 def back_button(destination="home"):
@@ -111,7 +116,7 @@ def back_button(destination="home"):
         [InlineKeyboardButton("⬅️ Назад", callback_data=destination)]
     ])
 
-CATEGORIES = ["Обувь", "Одежда", "Ремни", "Рюкзаки"]
+CATEGORIES = ["Обувь", "Одежда", "Ремни", "Рюкзаки", "Головные уборы", "Куртки"]
 
 
 # ============================================================
@@ -137,6 +142,12 @@ async def show_catalog(query):
     )
 
 async def show_category(query, category):
+    if category == "Куртки":
+        await query.edit_message_text(
+            "🧥 КУРТКИ\n\nСкоро здесь появятся новинки. Категория ожидает пополнения!",
+            reply_markup=back_button("catalog")
+        )
+        return
     with connect_db() as db:
         products = db.execute(
             "SELECT id, name, price FROM products WHERE category=? ORDER BY id DESC",
@@ -177,9 +188,16 @@ async def show_product(query, product_id):
 
     if photo:
         try:
-            await query.message.reply_photo(
-                photo=photo, caption=text, reply_markup=keyboard
-            )
+            if photo.startswith("local:"):
+                image_path = PHOTO_DIR / photo.split(":", 1)[1]
+                with image_path.open("rb") as image_file:
+                    await query.message.reply_photo(
+                        photo=image_file, caption=text, reply_markup=keyboard
+                    )
+            else:
+                await query.message.reply_photo(
+                    photo=photo, caption=text, reply_markup=keyboard
+                )
             await query.delete_message()
         except Exception:
             await query.edit_message_text(text, reply_markup=keyboard)
@@ -658,8 +676,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             user_states.pop(user_id, None)
             return
-        if text not in CATEGORIES:
-            await update.message.reply_text("Выбери одну из категорий: Обувь, Одежда, Ремни, Рюкзаки.")
+        if text not in CATEGORIES or text == "Куртки":
+            await update.message.reply_text("Выбери категорию с товарами: Обувь, Одежда, Ремни, Рюкзаки или Головные уборы.")
             return
         state["category"] = text
         state["step"] = "product_name"
@@ -688,11 +706,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["step"] = "product_photo"
         await update.message.reply_text("Теперь отправь фото товара как фото или напиши «нет».")
     elif step == "product_photo":
-        # На этом шаге принимается текст «нет». Фото обрабатывается отдельным handler.
         if text.lower() == "нет":
             await finish_product(update, state, "")
         else:
-            await update.message.reply_text("Отправь фото изображением или напиши «нет».")
+            raw_number = text.strip().lstrip("#")
+            if raw_number.isdigit():
+                image_name = f"{int(raw_number):03d}.jpg"
+                if (PHOTO_DIR / image_name).is_file():
+                    await finish_product(update, state, f"local:{image_name}")
+                else:
+                    await update.message.reply_text("Такого номера фото нет. Посмотри список командой /photos.")
+            else:
+                await update.message.reply_text("Отправь фото, напиши номер из /photos (например 12) или «нет».")
     elif step == "order_delivery":
         await update.message.reply_text("Пожалуйста, выбери доставку кнопкой выше.")
 
@@ -737,6 +762,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states.pop(update.effective_user.id, None)
     await update.message.reply_text("Действие отменено.", reply_markup=main_menu())
 
+async def photos_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Команда доступна только администратору.")
+        return
+    index_file = Path("photos_index.jpg")
+    if index_file.is_file():
+        with index_file.open("rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption=("📸 ФОТОБАНК GRACE STORE\n\n"
+                         "Выбери номер на листе. При добавлении товара введи этот номер "
+                         "на шаге загрузки фото. Например: 12.")
+            )
+    else:
+        await update.message.reply_text("Файл photos_index.jpg не найден в проекте.")
+
+
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Эта команда доступна только администратору.")
@@ -744,6 +786,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👑 ПАНЕЛЬ АДМИНИСТРАТОРА\n\n"
         "/addproduct — добавить товар\n"
+        "/photos — посмотреть номера фотографий из архива\n"
         "/orders_admin — последние заказы\n"
         "/tickets — открытые обращения\n"
         "/reply НОМЕР текст — ответить на обращение\n"
@@ -756,14 +799,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ============================================================
 def main():
-    if TOKEN == "тарелка" or not TOKEN.strip():
-        raise RuntimeError(
-            'Замени TOKEN = "тарелка" на настоящий токен от @BotFather.'
-        )
-    if ADMIN_ID == 123456789:
-        raise RuntimeError(
-            "Замени ADMIN_ID = 123456789 на свой числовой Telegram ID."
-        )
+    if not TOKEN:
+        raise RuntimeError("Добавь BOT_TOKEN в переменные окружения Bothost.")
+    if ADMIN_ID <= 0:
+        raise RuntimeError("Добавь свой числовой ADMIN_ID в переменные окружения Bothost.")
 
     init_db()
     app = Application.builder().token(TOKEN).build()
@@ -771,6 +810,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("addproduct", add_product))
+    app.add_handler(CommandHandler("photos", photos_list))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(CommandHandler("tickets", admin_tickets))
     app.add_handler(CommandHandler("reply", reply_ticket))
