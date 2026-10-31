@@ -13,10 +13,10 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # ============================================================
 # ЗАМЕНИ слово "тарелка" на настоящий токен от @BotFather.
-TOKEN = "тарелка"
+TOKEN = "9138228373:AAF_DUbsqHcHViLq0J-1JD8nhr7uydxdcC4"
 
 # ЗАМЕНИ 123456789 на свой числовой Telegram ID.
-ADMIN_ID = 123456789
+ADMIN_ID = 5203432796
 
 # База данных хранится в папке data.
 DATA_DIR = Path("data")
